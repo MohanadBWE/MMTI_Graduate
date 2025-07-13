@@ -4,3 +4,5 @@ openpyxl
 rapidfuzz
 docxtpl
 Pillow
+gspread
+google-auth
