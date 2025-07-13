@@ -229,6 +229,15 @@ def generate_certificate(student_data, destination, grad_date, photo_file, gende
 
 # --- UI AND STYLING ---
 
+def get_image_as_base64(path):
+    """Encodes a local image file to a base64 string for embedding in HTML/CSS."""
+    try:
+        with open(path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
+    except FileNotFoundError:
+        st.error(f"Logo file not found: {path}.")
+        return None
+
 def apply_custom_styling():
     primary_color = "#003366"
     secondary_color = "#D4AF37"
