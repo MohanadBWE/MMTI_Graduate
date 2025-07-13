@@ -13,7 +13,9 @@ import time
 import gspread
 import io
 
-# --- Google API Imports ---
+# --- Image Processing & Google API Imports ---
+import numpy as np
+import cv2
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -33,7 +35,7 @@ try:
     SPREADSHEET_NAME = st.secrets.get("app_config", {}).get("spreadsheet_name", "")
     GDRIVE_FOLDER_ID = st.secrets.get("app_config", {}).get("gdrive_folder_id", "")
 except (KeyError, FileNotFoundError):
-    st.error("Required secrets not found. Please configure them for deployment.")
+    st.error("Required secrets not found. Please configure app_config and passwords in st.secrets.")
     EMPLOYEE_PASSWORD, SPREADSHEET_NAME, GDRIVE_FOLDER_ID = "123", "", ""
 
 TIME_SLOTS = [
@@ -46,7 +48,7 @@ os.makedirs(PHOTO_DIR, exist_ok=True)
 os.makedirs(GENERATED_DOCS_DIR, exist_ok=True)
 os.makedirs(ID_CARD_DIR, exist_ok=True)
 
-# --- CORE GOOGLE FUNCTIONS ---
+# --- CORE GOOGLE & HELPER FUNCTIONS ---
 
 @st.cache_resource
 def get_google_creds():
@@ -54,36 +56,59 @@ def get_google_creds():
     try:
         return st.secrets["gcp_service_account"]
     except (KeyError, FileNotFoundError):
-        st.error("Google credentials not found in secrets. Please check your configuration.")
         return None
 
 @st.cache_resource
 def get_gsheets_client(_creds):
+    """Initializes and returns the gspread client."""
     if _creds is None: return None
-    try: return gspread.service_account_from_dict(_creds)
-    except Exception as e: st.error(f"Failed to initialize Google Sheets client: {e}"); return None
+    try:
+        return gspread.service_account_from_dict(_creds)
+    except Exception as e:
+        st.error(f"Failed to initialize Google Sheets client: {e}")
+        return None
 
 @st.cache_resource
 def get_gdrive_service(_creds):
+    """Initializes and returns the Google Drive service."""
     if _creds is None: return None
     try:
         g_creds = service_account.Credentials.from_service_account_info(_creds, scopes=['https://www.googleapis.com/auth/drive'])
         return build('drive', 'v3', credentials=g_creds)
-    except Exception as e: st.error(f"Could not initialize Google Drive service: {e}"); return None
+    except Exception as e:
+        st.error(f"Could not initialize Google Drive service: {e}")
+        return None
 
 @st.cache_resource
 def get_vision_client(_creds):
+    """Initializes and returns the Google Vision client."""
     if _creds is None: return None
     try:
         g_creds = service_account.Credentials.from_service_account_info(_creds)
         return vision.ImageAnnotatorClient(credentials=g_creds)
-    except Exception as e: st.error(f"Could not initialize Google Vision client: {e}"); return None
+    except Exception as e:
+        st.error(f"Could not initialize Google Vision client: {e}")
+        return None
+
+def preprocess_image_for_ocr(image_bytes):
+    """Cleans an image to improve OCR accuracy."""
+    try:
+        img_array = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        processed_image = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        _, buffer = cv2.imencode('.png', processed_image)
+        return buffer.tobytes()
+    except Exception as e:
+        st.warning(f"Could not preprocess image. Using original. Error: {e}")
+        return image_bytes
 
 def extract_text_from_image(client, image_bytes):
     """Extracts text from an image using the Google Cloud Vision API."""
     if client is None: return ""
     try:
-        image = vision.Image(content=image_bytes)
+        processed_bytes = preprocess_image_for_ocr(image_bytes)
+        image = vision.Image(content=processed_bytes)
         response = client.document_text_detection(image=image)
         if response.error.message:
             st.error(f"Google Vision API Error: {response.error.message}")
@@ -94,7 +119,10 @@ def extract_text_from_image(client, image_bytes):
         return ""
 
 def upload_file_to_drive(service, file_path, file_name, folder_id):
-    if service is None or not folder_id or folder_id == "PASTE_YOUR_FOLDER_ID_HERE": return
+    """Uploads a local file to a specific Google Drive folder."""
+    if service is None or not folder_id or folder_id == "PASTE_YOUR_FOLDER_ID_HERE":
+        st.warning(f"Skipping Google Drive upload for {file_name}. Service not configured.")
+        return
     try:
         file_metadata = {'name': file_name, 'parents': [folder_id]}
         media = MediaFileUpload(file_path, resumable=True)
@@ -104,6 +132,7 @@ def upload_file_to_drive(service, file_path, file_name, folder_id):
 
 @st.cache_data(ttl=300)
 def load_student_data(_gc_client):
+    """Loads student data from the Google Sheet."""
     if _gc_client is None: return None
     try:
         spreadsheet = _gc_client.open(SPREADSHEET_NAME)
@@ -118,6 +147,7 @@ def load_student_data(_gc_client):
         return None
 
 def get_available_slot(gsheets_client):
+    """Finds the next available appointment slot from the Google Sheet."""
     if gsheets_client is None: return None, None
     try:
         spreadsheet = gsheets_client.open(SPREADSHEET_NAME)
@@ -144,6 +174,7 @@ def get_available_slot(gsheets_client):
         check_date += timedelta(days=1)
 
 def log_appointment(gsheets_client, name, slot, date):
+    """Logs a new appointment by appending a row to the Google Sheet."""
     if gsheets_client is None: return
     try:
         spreadsheet = gsheets_client.open(SPREADSHEET_NAME)
@@ -173,9 +204,81 @@ def match_name(input_name, df):
             return matched_row.iloc[0]
     return None
 
-# ... (apply_custom_styling and generate_certificate functions remain the same) ...
+def generate_certificate(student_data, destination, grad_date, photo_file, gender):
+    template_path = MALE_TEMPLATE if gender == "Male" else FEMALE_TEMPLATE
+    try:
+        doc = DocxTemplate(template_path)
+    except Exception as e:
+        st.error(f"Error loading template: {e}"); return None
+    def get_value(key): return "" if pd.isna(student_data.get(key)) else str(student_data[key])
+    style_name = 'pt_bold heading'
+    img = Image.open(photo_file)
+    safe_full_name = "".join(x for x in get_value('full_name') if x.isalnum())
+    img_path = os.path.join(PHOTO_DIR, f"{safe_full_name}_photo.png")
+    img.save(img_path)
+    image_for_template = InlineImage(doc, img_path, width=Cm(3.5))
+    context = {'full_name': RichText(get_value("full_name"), style=style_name), 'type_of_study': RichText(get_value("type_of_study"), style=style_name), 'department': RichText(get_value("department"), style=style_name), 'section': RichText(get_value("section"), style=style_name), 'average': RichText(get_value("average"), style=style_name), 'appreciation': RichText(get_value("appreciation"), style=style_name), 'rank': RichText(get_value("rank"), style=style_name), 'total': RichText(get_value("total"), style=style_name), 'top_rank': RichText(get_value("top_rank"), style=style_name), 'destination': RichText(destination, style=style_name), 'grad_date': RichText(grad_date, style=style_name), 'photo': image_for_template}
+    try:
+        doc.render(context)
+        file_name = f"{safe_full_name}_certificate.docx"
+        docx_path = os.path.join(GENERATED_DOCS_DIR, file_name)
+        doc.save(docx_path)
+        return docx_path
+    except Exception as e:
+        st.error(f"Failed to render document: {e}"); return None
 
-# --- UI RENDERING FUNCTIONS ---
+# --- UI AND STYLING ---
+
+def apply_custom_styling():
+    primary_color = "#003366"
+    secondary_color = "#D4AF37"
+    background_color = "#F0F2F6"
+    text_color = "#31333F"
+    sidebar_widget_color = "#B22222"
+    light_primary = "#E0E7FF"
+    form_bg_color = "#FFFFFF"
+
+    custom_css = f"""
+        <style>
+            .app-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }}
+            .app-header h1 {{ color: {primary_color}; text-align: center; font-size: 2.5rem; margin: 0; }}
+            .app-header img {{ width: 120px; }}
+            .stApp {{ background-color: {background_color}; }}
+            [data-testid="stAppViewContainer"] {{ color: {text_color}; }}
+            [data-testid="stAppViewContainer"] h1, 
+            [data-testid="stAppViewContainer"] h2, 
+            [data-testid="stAppViewContainer"] h3 {{ color: {primary_color}; }}
+            [data-testid="stAlert"] * {{ color: #004085; }}
+            [data-testid="stSidebar"] {{ background-color: {primary_color}; }}
+            [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] label,
+            [data-testid="stSidebar"] div[data-baseweb="select"] > div > div {{ color: white !important; }}
+            [data-testid="stSidebar"] div[data-baseweb="select"] > div {{ background-color: {sidebar_widget_color}; border: 2px solid {secondary_color}; }}
+            [data-testid="stSidebar"] div[data-baseweb="select"] svg {{ fill: {secondary_color}; }}
+            [data-baseweb="popover"] ul {{ background-color: {sidebar_widget_color}; }}
+            [data-baseweb="popover"] ul li {{ color: white !important; }}
+            [data-baseweb="popover"] ul li:hover {{ background-color: {secondary_color}; color: {primary_color} !important; }}
+            [data-testid="stForm"] {{ background-color: {form_bg_color}; border: 1px solid #E0E0E0; border-radius: 10px; padding: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
+            .stTextInput>div>div>input, .stTextArea>div>div>textarea {{ background-color: {form_bg_color}; border: 1px solid #A9A9A9; box-shadow: inset 0 1px 2px rgba(0,0,0,0.07); border-radius: 5px; }}
+            .stTextInput>div>div>input:focus, .stTextArea>div>div>textarea:focus {{ border-color: {primary_color}; box-shadow: 0 0 0 2px {light_primary}; }}
+            [data-testid="stFileUploader"] section {{ background-color: #F0F2F6; border: 2px dashed #A9A9A9; }}
+            [data-testid="stFileUploader"] section:hover {{ border-color: {primary_color}; }}
+            [data-testid="stFileUploader"] section [data-testid="stText"] {{ color: {text_color}; }}
+            .stButton>button {{ background-color: {primary_color}; color: white; border: 2px solid {secondary_color}; border-radius: 8px; padding: 10px 24px; font-weight: bold; }}
+            .stButton>button:hover, .stDownloadButton>button:hover {{ background-color: {secondary_color}; color: {primary_color} !important; border-color: {primary_color}; }}
+            @media (max-width: 768px) {{
+                .app-header {{ flex-direction: column; gap: 1rem; }}
+                .app-header h1 {{ font-size: 1.8rem !important; }}
+                [data-testid="stForm"] {{ padding: 15px; }}
+            }}
+        </style>
+    """
+    st.markdown(custom_css, unsafe_allow_html=True)
+    logo_left_b64, logo_right_b64 = get_image_as_base64(LOGO_LEFT_PATH), get_image_as_base64(LOGO_RIGHT_PATH)
+    if logo_left_b64 and logo_right_b64:
+        st.markdown(f'<div class="app-header"><img src="data:image/webp;base64,{logo_left_b64}"><h1>نظام طلب وثيقة التخرج</h1><img src="data:image/webp;base64,{logo_right_b64}"></div>', unsafe_allow_html=True)
+
+# --- PAGE RENDERING ---
+
 def render_student_view(creds):
     if not creds:
         st.error("Application not configured. Missing Google credentials in secrets.")
@@ -185,7 +288,7 @@ def render_student_view(creds):
     student_df = load_student_data(gsheets_client)
     
     if student_df is None:
-        st.warning("Connecting to database... Please wait.")
+        st.warning("Connecting to database... Please wait or check secrets configuration.")
         return
 
     st.info("""**ملاحظات هامة عند استلام تأييد التخرج:**\n1. حضور الطالب شخصياً...\n2. جلب نسخة مصورة من البطاقة الموحدة.\n3. وصل تسديد اجور تحديث البيانات في البرنامج الوزاري SIS.\n4. جلب وصل بمبلغ الف دينار من الشعبة المالية كأجور تأييد التخرج.""")
@@ -196,8 +299,8 @@ def render_student_view(creds):
         gender = st.radio("الجنس:", ("Male", "Female"), horizontal=True)
         destination = st.text_input("الجهة المستفيدة من الوثيقة")
         photo = st.file_uploader("الصورة الشخصية", type=["jpg", "jpeg", "png"])
-        id_card_front = st.file_uploader("ارفع صورة وجه الهوية (للتأكيد)", type=["jpg", "jpeg", "png"])
-        id_card_back = st.file_uploader("ارفع صورة ظهر الهوية (للتأكيد)", type=["jpg", "jpeg", "png"])
+        id_card_front = st.file_uploader("ارفع صورة وجه الهوية", type=["jpg", "jpeg", "png"])
+        id_card_back = st.file_uploader("ارفع صورة ظهر الهوية", type=["jpg", "jpeg", "png"])
         agreement = st.checkbox("أتعهد بإحضار المستمسكات المطلوبة معي")
         submitted = st.form_submit_button("إرسال الطلب")
 
@@ -209,7 +312,7 @@ def render_student_view(creds):
             st.error("يرجى ملء جميع الحقول و إرفاق كافة الصور المطلوبة.")
             return
         
-        # --- OCR Security Check ---
+        # OCR Security Check
         with st.spinner("...جاري التحقق من الهوية"):
             vision_client = get_vision_client(creds)
             id_card_bytes = id_card_front.getvalue()
@@ -233,8 +336,7 @@ def render_student_view(creds):
                 return
 
         st.success("✅ تم التحقق من الهوية بنجاح.")
-
-        # If check passes, continue
+        
         gdrive_service = get_gdrive_service(creds)
         
         with st.spinner("...جاري البحث عن بيانات الطالب وحفظ الملفات"):
@@ -276,10 +378,21 @@ def render_student_view(creds):
                 appointment_date_str = appointment_date.strftime('%Y-%m-%d')
                 st.success(f"✅ تم تقديم طلبك بنجاح. موعدك للمراجعة هو: {slot} بتاريخ {appointment_date_str}")
 
+def render_employee_view():
+    st.header("Employee Dashboard")
+    password = st.text_input("Enter Password", type="password", label_visibility="collapsed", placeholder="Enter Password")
+    if password == EMPLOYEE_PASSWORD:
+        st.success("Access Granted")
+        
+        if GDRIVE_FOLDER_ID and GDRIVE_FOLDER_ID != "PASTE_YOUR_FOLDER_ID_HERE":
+            st.link_button("View All Saved Files on Google Drive", f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
+        
+    elif password:
+        st.error("Incorrect password.")
+
 # --- MAIN APP LOGIC ---
-# Make sure to define your full `apply_custom_styling` and `generate_certificate` functions above
 st.set_page_config(page_title="نظام طلب وثيقة التخرج", page_icon=LOGO_LEFT_PATH, layout="wide")
-# apply_custom_styling() 
+apply_custom_styling() 
 st.sidebar.markdown('<h2 style="color: #D4AF37;">Portal Navigation</h2>', unsafe_allow_html=True)
 app_mode = st.sidebar.selectbox("Choose your role:", ["Student Application", "Employee Dashboard"])
 
@@ -287,5 +400,5 @@ google_credentials = get_google_creds()
 
 if app_mode == "Student Application":
     render_student_view(google_credentials)
-# elif app_mode == "Employee Dashboard":
-#     render_employee_view()
+elif app_mode == "Employee Dashboard":
+    render_employee_view()
