@@ -230,7 +230,6 @@ def generate_certificate(student_data, destination, grad_date, photo_file, gende
 # --- UI AND STYLING ---
 
 def get_image_as_base64(path):
-    """Encodes a local image file to a base64 string for embedding in HTML/CSS."""
     try:
         with open(path, "rb") as img_file:
             return base64.b64encode(img_file.read()).decode()
@@ -246,7 +245,6 @@ def apply_custom_styling():
     sidebar_widget_color = "#B22222"
     light_primary = "#E0E7FF"
     form_bg_color = "#FFFFFF"
-
     custom_css = f"""
         <style>
             .app-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }}
@@ -321,7 +319,7 @@ def render_student_view(creds):
             st.error("يرجى ملء جميع الحقول و إرفاق كافة الصور المطلوبة.")
             return
         
-        # OCR Security Check
+        # --- OCR Security Check ---
         with st.spinner("...جاري التحقق من الهوية"):
             vision_client = get_vision_client(creds)
             id_card_bytes = id_card_front.getvalue()
@@ -331,17 +329,31 @@ def render_student_view(creds):
                 st.error("لم نتمكن من قراءة النص من صورة الهوية. يرجى استخدام صورة أوضح.")
                 return
 
-            normalized_ocr_text = normalize_arabic_name(ocr_text).replace(" ","")
-            name_parts = name.strip().split()
-            if len(name_parts) < 2:
-                st.error("يرجى إدخال اسمك الأول والثاني على الأقل.")
-                return
-            
-            first_two_names = " ".join(name_parts[:2])
-            normalized_first_two = normalize_arabic_name(first_two_names).replace(" ", "")
+            # --- New, more intelligent name extraction logic ---
+            normalized_ocr = " ".join(ocr_text.replace(":", " ").replace("/", " ").split())
+            try:
+                first_name_match = re.search(r'(?:الاسم|ناو)\s+(\S+)', normalized_ocr)
+                father_name_match = re.search(r'(?:الاب|باوك)\s+(\S+)', normalized_ocr)
+                grandfather_name_match = re.search(r'(?:الجد|بابير)\s+(\S+)', normalized_ocr)
 
-            if normalized_first_two not in normalized_ocr_text:
-                st.error("خطأ في التحقق: الاسم في الهوية لا يتطابق مع الاسم المدخل.")
+                if not (first_name_match and father_name_match and grandfather_name_match):
+                    st.error("خطأ في التحقق: لم نتمكن من تحديد حقول الاسم والاب والجد في الهوية. يرجى استخدام صورة أوضح.")
+                    return
+
+                name_from_id = f"{first_name_match.group(1)} {father_name_match.group(1)} {grandfather_name_match.group(1)}"
+            except Exception:
+                st.error("حدث خطأ أثناء تحليل نص الهوية. يرجى المحاولة مرة أخرى.")
+                return
+
+            name_from_form = " ".join(name.strip().split()[:3])
+            normalized_id_name = normalize_arabic_name(name_from_id)
+            normalized_form_name = normalize_arabic_name(name_from_form)
+            
+            similarity_score = fuzz.ratio(normalized_id_name, normalized_form_name)
+
+            if similarity_score < 85:
+                st.error(f"خطأ في التحقق: الاسم في الهوية لا يتطابق مع الاسم المدخل.")
+                st.info(f"DEBUG: Name from Form -> '{normalized_form_name}' | Name from ID -> '{normalized_id_name}'")
                 return
 
         st.success("✅ تم التحقق من الهوية بنجاح.")
