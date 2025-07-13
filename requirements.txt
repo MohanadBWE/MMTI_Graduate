@@ -4,3 +4,4 @@ openpyxl
 rapidfuzz
 docxtpl
 Pillow
+streamlit-gsheets-connection
