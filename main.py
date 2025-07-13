@@ -10,30 +10,23 @@ import base64
 import re
 from docxtpl.richtext import RichText
 import time
-import gspread
-
-# --- Google Drive/API Imports ---
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 
 # --- CONFIGURATION ---
 MALE_TEMPLATE = "male_template.docx"
 FEMALE_TEMPLATE = "female_template.docx"
+EXCEL_FILE = "graduate_data.xlsx" # Using local Excel file
 PHOTO_DIR = "photo_uploads"
 GENERATED_DOCS_DIR = "generated_docs"
 ID_CARD_DIR = "id_card_uploads"
+APPOINTMENT_LOG = "appointments_log.csv" # Using local CSV file
 LOGO_LEFT_PATH = "mmti.webp"
 LOGO_RIGHT_PATH = "ntu.webp"
 
-# Read secrets safely
+# Use a simple password directly or from secrets if available
 try:
     EMPLOYEE_PASSWORD = st.secrets.get("passwords", {}).get("employee", "123")
-    SPREADSHEET_NAME = st.secrets.get("app_config", {}).get("spreadsheet_name", "")
-    GDRIVE_FOLDER_ID = st.secrets.get("app_config", {}).get("gdrive_folder_id", "")
 except (KeyError, FileNotFoundError):
-    st.error("Required secrets not found. Please configure app_config and passwords in st.secrets.")
-    EMPLOYEE_PASSWORD, SPREADSHEET_NAME, GDRIVE_FOLDER_ID = "123", "", ""
+    EMPLOYEE_PASSWORD = "123" # Fallback for local development
 
 # Appointment settings
 TIME_SLOTS = [
@@ -48,103 +41,10 @@ os.makedirs(PHOTO_DIR, exist_ok=True)
 os.makedirs(GENERATED_DOCS_DIR, exist_ok=True)
 os.makedirs(ID_CARD_DIR, exist_ok=True)
 
-# --- CORE GOOGLE & HELPER FUNCTIONS ---
-
-@st.cache_resource
-def get_google_creds():
-    """Gets Google credentials from Streamlit secrets."""
-    try:
-        return st.secrets["gcp_service_account"]
-    except (KeyError, FileNotFoundError):
-        return None
-
-@st.cache_resource
-def get_gsheets_client(_creds):
-    """Initializes and returns the gspread client."""
-    if _creds is None: return None
-    try:
-        return gspread.service_account_from_dict(_creds)
-    except Exception as e:
-        st.error(f"Failed to initialize Google Sheets client: {e}")
-        return None
-
-@st.cache_resource
-def get_gdrive_service(_creds):
-    """Initializes and returns the Google Drive service."""
-    if _creds is None: return None
-    try:
-        g_creds = service_account.Credentials.from_service_account_info(_creds, scopes=['https://www.googleapis.com/auth/drive'])
-        return build('drive', 'v3', credentials=g_creds)
-    except Exception as e:
-        st.error(f"Could not initialize Google Drive service: {e}")
-        return None
-
-def upload_file_to_drive(service, file_path, file_name, folder_id):
-    """Uploads a local file to a specific Google Drive folder."""
-    if service is None or not folder_id or folder_id == "PASTE_YOUR_FOLDER_ID_HERE":
-        st.warning(f"Skipping Google Drive upload for {file_name}. Service not configured.")
-        return
-    try:
-        file_metadata = {'name': file_name, 'parents': [folder_id]}
-        media = MediaFileUpload(file_path, resumable=True)
-        service.files().create(body=file_metadata, media_body=media, fields='id', supportsAllDrives=True).execute()
-    except Exception as e:
-        st.error(f"Failed to upload {file_name} to Google Drive. Error: {e}")
-
-@st.cache_data(ttl=300)
-def load_student_data(_gc_client):
-    """Loads student data from the Google Sheet."""
-    if _gc_client is None: return None
-    try:
-        spreadsheet = _gc_client.open(SPREADSHEET_NAME)
-        worksheet = spreadsheet.worksheet("Sheet1")
-        df = pd.DataFrame(worksheet.get_all_records())
-        df = df.dropna(how="all")
-        if 'full_name' in df.columns:
-            df['normalized_name_match'] = df['full_name'].astype(str).apply(lambda x: normalize_arabic_name(x).replace(" ", ""))
-        return df
-    except Exception as e:
-        st.error(f"Failed to read student data from Google Sheet. Error: {e}")
-        return None
-
-def get_available_slot(gsheets_client):
-    """Finds the next available appointment slot from the Google Sheet."""
-    if gsheets_client is None: return None, None
-    try:
-        spreadsheet = gsheets_client.open(SPREADSHEET_NAME)
-        worksheet = spreadsheet.worksheet("Appointments")
-        records = worksheet.get_all_records()
-        log_df = pd.DataFrame(records)
-        if not log_df.empty:
-            log_df = log_df.dropna(how="all")
-            log_df['date'] = pd.to_datetime(log_df['date']).dt.date
-    except gspread.exceptions.WorksheetNotFound:
-         st.error("The 'Appointments' tab was not found in your Google Sheet.")
-         return None, None
-    except Exception:
-        log_df = pd.DataFrame(columns=["name", "date", "slot"])
-    check_date = datetime.today().date() + timedelta(days=1)
-    while True:
-        day_log = log_df[log_df['date'] == check_date] if not log_df.empty else pd.DataFrame()
-        if len(day_log) < MAX_PER_DAY:
-            for start, end in TIME_SLOTS:
-                slot = f"{start}-{end}"
-                slot_count = len(day_log[day_log['slot'] == slot]) if not day_log.empty else 0
-                if slot_count < MAX_PER_SLOT:
-                    return slot, check_date
-        check_date += timedelta(days=1)
-
-def log_appointment(gsheets_client, name, slot, date):
-    """Logs a new appointment by appending a row to the Google Sheet."""
-    if gsheets_client is None: return
-    try:
-        spreadsheet = gsheets_client.open(SPREADSHEET_NAME)
-        worksheet = spreadsheet.worksheet("Appointments")
-        worksheet.append_row([name, date.strftime('%Y-%m-%d'), slot])
-    except Exception as e:
-        st.error(f"Failed to save appointment. Error: {e}")
+# --- CORE FUNCTIONS ---
 
 def normalize_arabic_name(name):
+    """Cleans and standardizes an Arabic name for better matching."""
     if not isinstance(name, str): return ""
     name = re.sub(r'^(ال)', '', name)
     name = re.sub(r'[أإآ]', 'ا', name)
@@ -153,8 +53,25 @@ def normalize_arabic_name(name):
     name = re.sub(r'\s+', ' ', name).strip()
     return name
 
+def load_student_data():
+    """Loads student data from the local Excel file."""
+    try:
+        df = pd.read_excel(EXCEL_FILE)
+        if 'full_name' in df.columns:
+            df['normalized_name_match'] = df['full_name'].astype(str).apply(lambda x: normalize_arabic_name(x).replace(" ", ""))
+        return df
+    except FileNotFoundError:
+        st.error(f"Error: The student data file '{EXCEL_FILE}' was not found in the repository.")
+        return None
+    except Exception as e:
+        st.error(f"An error occurred while reading the Excel file: {e}")
+        return None
+
 def match_name(input_name, df):
-    if df is None or 'normalized_name_match' not in df.columns: return None
+    """Finds the best match for a student's name."""
+    if df is None or 'normalized_name_match' not in df.columns:
+        st.error("Student data could not be loaded or is missing the 'full_name' column.")
+        return None
     normalized_input = normalize_arabic_name(input_name).replace(" ", "")
     names = df['normalized_name_match'].dropna().tolist()
     matches = process.extract(normalized_input, names, limit=1, score_cutoff=90, scorer=fuzz.partial_ratio)
@@ -164,6 +81,32 @@ def match_name(input_name, df):
         if not matched_row.empty:
             return matched_row.iloc[0]
     return None
+
+def get_available_slot():
+    """Finds the next available day and time slot from the local CSV file."""
+    try:
+        log_df = pd.read_csv(APPOINTMENT_LOG)
+        log_df['date'] = pd.to_datetime(log_df['date']).dt.date
+    except FileNotFoundError:
+        log_df = pd.DataFrame(columns=["name", "date", "slot"])
+
+    check_date = datetime.today().date() + timedelta(days=1)
+    
+    while True:
+        day_log = log_df[log_df['date'] == check_date] if not log_df.empty else pd.DataFrame()
+        if len(day_log) < MAX_PER_DAY:
+            for start, end in TIME_SLOTS:
+                slot = f"{start}-{end}"
+                slot_count = len(day_log[day_log['slot'] == slot]) if not day_log.empty else 0
+                if slot_count < MAX_PER_SLOT:
+                    return slot, check_date, log_df
+        check_date += timedelta(days=1)
+
+def log_appointment(name, slot, date, log_df):
+    """Logs a new appointment to the local CSV file."""
+    new_row = pd.DataFrame([{"name": name, "date": date.strftime('%Y-%m-%d'), "slot": slot}])
+    updated_log = pd.concat([log_df, new_row], ignore_index=True)
+    updated_log.to_csv(APPOINTMENT_LOG, index=False)
 
 def generate_certificate(student_data, destination, grad_date, photo_file, gender):
     template_path = MALE_TEMPLATE if gender == "Male" else FEMALE_TEMPLATE
@@ -247,16 +190,9 @@ def apply_custom_styling():
 
 # --- PAGE RENDERING ---
 
-def render_student_view(creds):
-    if not creds:
-        st.error("Application not configured. Missing Google credentials in secrets.")
-        return
-    
-    gsheets_client = get_gsheets_client(creds)
-    student_df = load_student_data(gsheets_client)
-    
+def render_student_view():
+    student_df = load_student_data()
     if student_df is None:
-        st.warning("Connecting to database... Please wait or check secrets configuration.")
         return
 
     st.info("""**ملاحظات هامة عند استلام تأييد التخرج:**\n1. حضور الطالب شخصياً...\n2. جلب نسخة مصورة من البطاقة الموحدة.\n3. وصل تسديد اجور تحديث البيانات في البرنامج الوزاري SIS.\n4. جلب وصل بمبلغ الف دينار من الشعبة المالية كأجور تأييد التخرج.""")
@@ -280,46 +216,48 @@ def render_student_view(creds):
             st.error("يرجى ملء جميع الحقول و إرفاق كافة الصور المطلوبة.")
             return
         
-        gdrive_service = get_gdrive_service(creds)
-        
-        with st.spinner("...جاري البحث عن بيانات الطالب وحفظ الملفات"):
+        with st.spinner("...جاري التحقق من الطلب"):
             safe_name = re.sub(r'[^A-Za-z0-9ا-ي]', '_', name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            files_to_upload = {
-                f"{safe_name}_{timestamp}_photo.png": photo,
-                f"{safe_name}_{timestamp}_front.png": id_card_front,
-                f"{safe_name}_{timestamp}_back.png": id_card_back
-            }
-            for filename, file_uploader in files_to_upload.items():
-                file_bytes = file_uploader.getvalue()
-                temp_path = os.path.join(PHOTO_DIR, filename)
-                with open(temp_path, "wb") as f:
-                    f.write(file_bytes)
-                upload_file_to_drive(gdrive_service, temp_path, filename, GDRIVE_FOLDER_ID)
+            # Save ID cards to a local (temporary) folder
+            id_card_front_bytes = id_card_front.getvalue()
+            id_filename_front = f"{safe_name}_{timestamp}_front.png"
+            id_filepath_front = os.path.join(ID_CARD_DIR, id_filename_front)
+            with open(id_filepath_front, "wb") as f:
+                f.write(id_card_front_bytes)
 
+            id_card_back_bytes = id_card_back.getvalue()
+            id_filename_back = f"{safe_name}_{timestamp}_back.png"
+            id_filepath_back = os.path.join(ID_CARD_DIR, id_filename_back)
+            with open(id_filepath_back, "wb") as f:
+                f.write(id_card_back_bytes)
+            
+            time.sleep(3) # Simulate processing time
+        
+        st.success("✅ تم التحقق من الطلب.")
+
+        with st.spinner("...جاري البحث عن بيانات الطالب"):
             matched_student = match_name(name, student_df)
 
         if matched_student is None:
             st.error("الاسم غير موجود في قاعدة البيانات.")
-            return
-
-        st.success(f"تم العثور على الطالب: {matched_student['full_name']}")
-        
-        with st.spinner("...جاري إصدار الوثيقة وحجز الموعد"):
-            slot, appointment_date = get_available_slot(gsheets_client)
-            if not slot:
-                st.warning("عذراً، جميع المواعيد محجوزة حالياً.")
-                return
+        else:
+            st.success(f"تم العثور على الطالب: {matched_student['full_name']}")
             
-            grad_date_str = datetime.now().strftime("%d-%m-%Y")
-            doc_path = generate_certificate(matched_student, destination, grad_date_str, photo, gender)
-            
-            if doc_path:
-                upload_file_to_drive(gdrive_service, doc_path, os.path.basename(doc_path), GDRIVE_FOLDER_ID)
-                log_appointment(gsheets_client, matched_student["full_name"], slot, appointment_date)
-                appointment_date_str = appointment_date.strftime('%Y-%m-%d')
-                st.success(f"✅ تم تقديم طلبك بنجاح. موعدك للمراجعة هو: {slot} بتاريخ {appointment_date_str}")
+            with st.spinner("...جاري إصدار الوثيقة وحجز الموعد"):
+                slot, appointment_date, log_df = get_available_slot()
+                if not slot:
+                    st.warning("عذراً، جميع المواعيد محجوزة حالياً.")
+                    return
+                
+                grad_date_str = datetime.now().strftime("%d-%m-%Y")
+                doc_path = generate_certificate(matched_student, destination, grad_date_str, photo, gender)
+                
+                if doc_path:
+                    log_appointment(matched_student["full_name"], slot, appointment_date, log_df)
+                    appointment_date_str = appointment_date.strftime('%Y-%m-%d')
+                    st.success(f"✅ تم تقديم طلبك بنجاح. موعدك للمراجعة هو: {slot} بتاريخ {appointment_date_str}")
 
 def render_employee_view():
     st.header("Employee Dashboard")
@@ -327,9 +265,36 @@ def render_employee_view():
     if password == EMPLOYEE_PASSWORD:
         st.success("Access Granted")
         
-        if GDRIVE_FOLDER_ID and GDRIVE_FOLDER_ID != "PASTE_YOUR_FOLDER_ID_HERE":
-            st.link_button("View All Saved Files on Google Drive", f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
+        st.warning("Note: Files listed below are temporary and will be deleted when the app restarts. Please download them daily.")
         
+        # Section for Generated Certificates
+        st.subheader("Generated Certificates")
+        try:
+            cert_files = os.listdir(GENERATED_DOCS_DIR)
+            if not cert_files: 
+                st.info("No certificates have been generated in this session.")
+            else:
+                for file in sorted(cert_files, reverse=True):
+                    file_path = os.path.join(GENERATED_DOCS_DIR, file)
+                    with open(file_path, "rb") as f:
+                        st.download_button(label=f"Download {file}", data=f, file_name=file)
+        except Exception as e: 
+            st.error(f"Could not read certificates directory: {e}")
+            
+        # Section for Uploaded ID Cards
+        st.subheader("Uploaded ID Cards")
+        try:
+            id_files = os.listdir(ID_CARD_DIR)
+            if not id_files: 
+                st.info("No ID cards have been uploaded in this session.")
+            else:
+                for file in sorted(id_files, reverse=True):
+                    file_path = os.path.join(ID_CARD_DIR, file)
+                    with open(file_path, "rb") as f:
+                        st.download_button(label=f"Download {file}", data=f, file_name=file)
+        except Exception as e: 
+            st.error(f"Could not read ID card directory: {e}")
+
     elif password:
         st.error("Incorrect password.")
 
@@ -339,9 +304,7 @@ apply_custom_styling()
 st.sidebar.markdown('<h2 style="color: #D4AF37;">Portal Navigation</h2>', unsafe_allow_html=True)
 app_mode = st.sidebar.selectbox("Choose your role:", ["Student Application", "Employee Dashboard"])
 
-google_credentials = get_google_creds()
-
 if app_mode == "Student Application":
-    render_student_view(google_credentials)
+    render_student_view()
 elif app_mode == "Employee Dashboard":
     render_employee_view()
