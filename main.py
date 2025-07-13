@@ -134,7 +134,11 @@ def generate_certificate(student_data, destination, grad_date, photo_file, gende
     safe_full_name = "".join(x for x in get_value('full_name') if x.isalnum())
     img_path = os.path.join(PHOTO_DIR, f"{safe_full_name}_photo.png")
     img.save(img_path)
-    image_for_template = InlineImage(doc, img_path, width=Cm(3.5))
+    
+    # --- THIS IS THE FIX ---
+    # Set both width and height to force the image to fit the container
+    image_for_template = InlineImage(doc, img_path, width=Cm(3.5), height=Cm(4.5))
+
     context = {'full_name': RichText(get_value("full_name"), style=style_name), 'type_of_study': RichText(get_value("type_of_study"), style=style_name), 'department': RichText(get_value("department"), style=style_name), 'section': RichText(get_value("section"), style=style_name), 'average': RichText(get_value("average"), style=style_name), 'appreciation': RichText(get_value("appreciation"), style=style_name), 'rank': RichText(get_value("rank"), style=style_name), 'total': RichText(get_value("total"), style=style_name), 'top_rank': RichText(get_value("top_rank"), style=style_name), 'destination': RichText(destination, style=style_name), 'grad_date': RichText(grad_date, style=style_name), 'photo': image_for_template}
     try:
         doc.render(context)
@@ -234,7 +238,8 @@ def render_student_view(gsheets_client):
         with st.spinner("...جاري حفظ الملفات مؤقتاً"):
             safe_name = re.sub(r'[^A-Za-z0-9ا-ي]', '_', name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            # This section saves ID cards locally for temporary use.
+            
+            # Save ID cards to a local (temporary) folder
             id_card_front_bytes = id_card_front.getvalue()
             id_filename_front = f"{safe_name}_{timestamp}_front.png"
             id_filepath_front = os.path.join(ID_CARD_DIR, id_filename_front)
@@ -315,13 +320,9 @@ apply_custom_styling()
 st.sidebar.markdown('<h2 style="color: #D4AF37;">Portal Navigation</h2>', unsafe_allow_html=True)
 app_mode = st.sidebar.selectbox("Choose your role:", ["Student Application", "Employee Dashboard"])
 
-# Get the client at the start
 gsheets_client = get_gsheets_client()
 
 if app_mode == "Student Application":
-    if gsheets_client:
-        render_student_view(gsheets_client)
-    else:
-        st.error("Application is not configured correctly. Missing or invalid Google credentials in secrets.")
+    render_student_view(gsheets_client)
 elif app_mode == "Employee Dashboard":
     render_employee_view()
