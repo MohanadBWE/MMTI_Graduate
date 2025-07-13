@@ -10,25 +10,23 @@ import base64
 import re
 from docxtpl.richtext import RichText
 import time
-from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURATION ---
 MALE_TEMPLATE = "male_template.docx"
 FEMALE_TEMPLATE = "female_template.docx"
+EXCEL_FILE = "graduate_data.xlsx"
+APPOINTMENT_LOG = "appointments_log.csv"
 PHOTO_DIR = "photo_uploads"
 GENERATED_DOCS_DIR = "generated_docs"
 ID_CARD_DIR = "id_card_uploads"
 LOGO_LEFT_PATH = "mmti.webp"
 LOGO_RIGHT_PATH = "ntu.webp"
 
-# Use secrets for password and spreadsheet name
+# Use a simple password directly or from secrets if available
 try:
     EMPLOYEE_PASSWORD = st.secrets.get("passwords", {}).get("employee", "123")
-    SPREADSHEET_NAME = st.secrets.get("app_config", {}).get("spreadsheet_name", "")
 except (KeyError, FileNotFoundError):
-    st.error("Required secrets not found. Please configure them for deployment.")
     EMPLOYEE_PASSWORD = "123" # Fallback for local development
-    SPREADSHEET_NAME = ""
 
 # Appointment settings
 TIME_SLOTS = [
@@ -55,24 +53,23 @@ def normalize_arabic_name(name):
     name = re.sub(r'\s+', ' ', name).strip()
     return name
 
-@st.cache_data(ttl=300) # Cache for 5 minutes
 def load_student_data():
-    """Loads student data from the secure Google Sheet."""
+    """Loads student data from the local Excel file."""
     try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        df = conn.read(worksheet="Sheet1") # Assumes student data is on the first sheet
-        df = df.dropna(how="all")
+        df = pd.read_excel(EXCEL_FILE)
         if 'full_name' in df.columns:
             df['normalized_name_match'] = df['full_name'].astype(str).apply(lambda x: normalize_arabic_name(x).replace(" ", ""))
         return df
+    except FileNotFoundError:
+        st.error(f"Error: The student data file '{EXCEL_FILE}' was not found in the repository.")
+        return None
     except Exception as e:
-        st.error(f"Failed to connect to Google Sheets for student data. Error: {e}")
+        st.error(f"An error occurred while reading the Excel file: {e}")
         return None
 
 def match_name(input_name, df):
     """Finds the best match for a student's name."""
     if df is None or 'normalized_name_match' not in df.columns:
-        st.error("Student data could not be loaded or is missing the 'full_name' column.")
         return None
     normalized_input = normalize_arabic_name(input_name).replace(" ", "")
     names = df['normalized_name_match'].dropna().tolist()
@@ -85,14 +82,11 @@ def match_name(input_name, df):
     return None
 
 def get_available_slot():
-    """Finds the next available day and time slot from the Google Sheet."""
+    """Finds the next available day and time slot from the local CSV file."""
     try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        log_df = conn.read(worksheet="Appointments", usecols=list(range(3)), ttl=60)
-        log_df = log_df.dropna(how="all")
-        if not log_df.empty:
-            log_df['date'] = pd.to_datetime(log_df['date']).dt.date
-    except Exception:
+        log_df = pd.read_csv(APPOINTMENT_LOG)
+        log_df['date'] = pd.to_datetime(log_df['date']).dt.date
+    except FileNotFoundError:
         log_df = pd.DataFrame(columns=["name", "date", "slot"])
 
     check_date = datetime.today().date() + timedelta(days=1)
@@ -104,17 +98,14 @@ def get_available_slot():
                 slot = f"{start}-{end}"
                 slot_count = len(day_log[day_log['slot'] == slot]) if not day_log.empty else 0
                 if slot_count < MAX_PER_SLOT:
-                    return slot, check_date
+                    return slot, check_date, log_df
         check_date += timedelta(days=1)
 
-def log_appointment(name, slot, date):
-    """Logs a new appointment by appending to the Google Sheet."""
-    try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        new_row = pd.DataFrame([{"name": name, "date": date.strftime('%Y-%m-%d'), "slot": slot}])
-        conn.update(worksheet="Appointments", data=new_row)
-    except Exception as e:
-        st.error(f"Failed to save appointment. Please try again. Error: {e}")
+def log_appointment(name, slot, date, log_df):
+    """Logs a new appointment to the local CSV file."""
+    new_row = pd.DataFrame([{"name": name, "date": date.strftime('%Y-%m-%d'), "slot": slot}])
+    updated_log = pd.concat([log_df, new_row], ignore_index=True)
+    updated_log.to_csv(APPOINTMENT_LOG, index=False)
 
 def generate_certificate(student_data, destination, grad_date, photo_file, gender):
     template_path = MALE_TEMPLATE if gender == "Male" else FEMALE_TEMPLATE
@@ -201,7 +192,6 @@ def apply_custom_styling():
 def render_student_view():
     student_df = load_student_data()
     if student_df is None:
-        st.warning("Connecting to student database... If this message persists, please check app secrets and Google Sheet configuration.")
         return
 
     st.info("""**ملاحظات هامة عند استلام تأييد التخرج:**\n1. حضور الطالب شخصياً...\n2. جلب نسخة مصورة من البطاقة الموحدة.\n3. وصل تسديد اجور تحديث البيانات في البرنامج الوزاري SIS.\n4. جلب وصل بمبلغ الف دينار من الشعبة المالية كأجور تأييد التخرج.""")
@@ -212,8 +202,8 @@ def render_student_view():
         gender = st.radio("الجنس:", ("Male", "Female"), horizontal=True)
         destination = st.text_input("الجهة المستفيدة من الوثيقة")
         photo = st.file_uploader("الصورة الشخصية", type=["jpg", "jpeg", "png"])
-        id_card_front = st.file_uploader("ارفع صورة وجه الهوية", type=["jpg", "jpeg", "png"])
-        id_card_back = st.file_uploader("ارفع صورة ظهر الهوية", type=["jpg", "jpeg", "png"])
+        id_card_front = st.file_uploader("ارفع صورة وجه الهوية (للتأكيد)", type=["jpg", "jpeg", "png"])
+        id_card_back = st.file_uploader("ارفع صورة ظهر الهوية (للتأكيد)", type=["jpg", "jpeg", "png"])
         agreement = st.checkbox("أتعهد بإحضار المستمسكات المطلوبة معي")
         submitted = st.form_submit_button("إرسال الطلب")
 
@@ -225,7 +215,7 @@ def render_student_view():
             st.error("يرجى ملء جميع الحقول و إرفاق كافة الصور المطلوبة.")
             return
         
-        with st.spinner("...جاري حفظ الملفات مؤقتاً"):
+        with st.spinner("...جاري التحقق من الطلب"):
             safe_name = re.sub(r'[^A-Za-z0-9ا-ي]', '_', name)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
@@ -241,7 +231,11 @@ def render_student_view():
             id_filepath_back = os.path.join(ID_CARD_DIR, id_filename_back)
             with open(id_filepath_back, "wb") as f:
                 f.write(id_card_back_bytes)
+            
+            time.sleep(3) # Simulate processing time
         
+        st.success("✅ تم التحقق من الطلب.")
+
         with st.spinner("...جاري البحث عن بيانات الطالب"):
             matched_student = match_name(name, student_df)
 
@@ -251,7 +245,7 @@ def render_student_view():
             st.success(f"تم العثور على الطالب: {matched_student['full_name']}")
             
             with st.spinner("...جاري إصدار الوثيقة وحجز الموعد"):
-                slot, appointment_date = get_available_slot()
+                slot, appointment_date, log_df = get_available_slot()
                 if not slot:
                     st.warning("عذراً، جميع المواعيد محجوزة حالياً.")
                     return
@@ -260,8 +254,7 @@ def render_student_view():
                 doc_path = generate_certificate(matched_student, destination, grad_date_str, photo, gender)
                 
                 if doc_path:
-                    # Log appointment to the secure Google Sheet
-                    log_appointment(matched_student["full_name"], slot, appointment_date)
+                    log_appointment(matched_student["full_name"], slot, appointment_date, log_df)
                     appointment_date_str = appointment_date.strftime('%Y-%m-%d')
                     st.success(f"✅ تم تقديم طلبك بنجاح. موعدك للمراجعة هو: {slot} بتاريخ {appointment_date_str}")
 
