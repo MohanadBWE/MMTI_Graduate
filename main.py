@@ -315,12 +315,13 @@ apply_custom_styling()
 st.sidebar.markdown('<h2 style="color: #D4AF37;">Portal Navigation</h2>', unsafe_allow_html=True)
 app_mode = st.sidebar.selectbox("Choose your role:", ["Student Application", "Employee Dashboard"])
 
-google_creds = get_google_creds()
+# Get the client at the start
+gsheets_client = get_gsheets_client()
 
 if app_mode == "Student Application":
-    if google_creds:
-        render_student_view(google_creds)
+    if gsheets_client:
+        render_student_view(gsheets_client)
     else:
-        st.error("Application is not configured correctly. Missing Google credentials in secrets.")
+        st.error("Application is not configured correctly. Missing or invalid Google credentials in secrets.")
 elif app_mode == "Employee Dashboard":
     render_employee_view()
