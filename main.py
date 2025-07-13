@@ -322,22 +322,27 @@ def render_student_view(creds):
         # --- OCR Security Check ---
         with st.spinner("...جاري التحقق من الهوية"):
             vision_client = get_vision_client(creds)
-            id_card_bytes = id_card_front.getvalue()
-            ocr_text = extract_text_from_image(vision_client, id_card_bytes)
             
-            if not ocr_text:
-                st.error("لم نتمكن من قراءة النص من صورة الهوية. يرجى استخدام صورة أوضح.")
+            # --- Combine text from both sides of the ID ---
+            front_bytes = id_card_front.getvalue()
+            back_bytes = id_card_back.getvalue()
+            
+            ocr_text_front = extract_text_from_image(vision_client, front_bytes)
+            ocr_text_back = extract_text_from_image(vision_client, back_bytes)
+            combined_ocr_text = ocr_text_front + " " + ocr_text_back
+            
+            if not combined_ocr_text.strip():
+                st.error("لم نتمكن من قراءة النص من صور الهوية. يرجى استخدام صور أوضح.")
                 return
 
-            # --- New, more intelligent name extraction logic ---
-            normalized_ocr = " ".join(ocr_text.replace(":", " ").replace("/", " ").split())
+            normalized_ocr = " ".join(combined_ocr_text.replace(":", " ").replace("/", " ").split())
             try:
                 first_name_match = re.search(r'(?:الاسم|ناو)\s+(\S+)', normalized_ocr)
                 father_name_match = re.search(r'(?:الاب|باوك)\s+(\S+)', normalized_ocr)
                 grandfather_name_match = re.search(r'(?:الجد|بابير)\s+(\S+)', normalized_ocr)
 
                 if not (first_name_match and father_name_match and grandfather_name_match):
-                    st.error("خطأ في التحقق: لم نتمكن من تحديد حقول الاسم والاب والجد في الهوية. يرجى استخدام صورة أوضح.")
+                    st.error("خطأ في التحقق: لم نتمكن من تحديد حقول الاسم والاب والجد في الهوية. يرجى استخدام صور أوضح.")
                     return
 
                 name_from_id = f"{first_name_match.group(1)} {father_name_match.group(1)} {grandfather_name_match.group(1)}"
@@ -353,7 +358,6 @@ def render_student_view(creds):
 
             if similarity_score < 85:
                 st.error(f"خطأ في التحقق: الاسم في الهوية لا يتطابق مع الاسم المدخل.")
-                st.info(f"DEBUG: Name from Form -> '{normalized_form_name}' | Name from ID -> '{normalized_id_name}'")
                 return
 
         st.success("✅ تم التحقق من الهوية بنجاح.")
