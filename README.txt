@@ -8,7 +8,3 @@
 3. Then:
    streamlit run main.py
 
-Place student Excel file (test_excel.xlsx) and Word template (test_template.docx) in the same folder.
-
-Generated PDFs appear in 'generated_pdfs/'.
-Photos are saved in 'photo_uploads/'.
